@@ -45,6 +45,70 @@ def _coerce_int(value: Any, path: str, errors: list[ValidationError], *,
     return None
 
 
+def _parse_label_audit(body: dict[str, Any], n_components: int | None,
+                       errors: list[ValidationError]) -> dict[str, Any] | None:
+    """Validate the optional ``label_audit`` section.
+
+    The section carries a per-component array of non-negative labeled mass
+    increments (aligned item-by-item with the submitted ``components`` array)
+    and the supplemental-peak tolerance.  At least one increment must be
+    positive; every error is located at its own field path.
+
+    ``n_components`` is ``None`` when the components array itself is invalid;
+    the length/all-zero checks are skipped in that case.
+    """
+    raw = body.get("label_audit")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        _err(errors, "invalid_type",
+             "'label_audit' must be an object", "/label_audit")
+        return None
+
+    inc_path = "/label_audit/label_mass_increments"
+    inc_raw = raw.get("label_mass_increments")
+    increments: list[int] | None = None
+    if not isinstance(inc_raw, list):
+        _err(errors, "invalid_type",
+             "'label_mass_increments' must be a list of non-negative "
+             "integers, one entry per component", inc_path)
+    else:
+        increments = []
+        for i, value in enumerate(inc_raw):
+            iv = _coerce_int(value, f"{inc_path}/{i}", errors,
+                             field="label mass increment")
+            if iv is None:
+                continue
+            if iv < 0:
+                _err(errors, "out_of_range",
+                     "'label mass increment' must be non-negative",
+                     f"{inc_path}/{i}")
+            increments.append(iv)
+        if n_components is None:
+            pass
+        elif len(inc_raw) != n_components:
+            _err(errors, "out_of_range",
+                     f"'label_mass_increments' must contain exactly "
+                     f"{n_components} entries aligned item-by-item with "
+                     f"'components', got {len(inc_raw)}", inc_path)
+        elif increments and len(increments) == n_components \
+                and all(v >= 0 for v in increments) \
+                and not any(v > 0 for v in increments):
+            _err(errors, "all_zero",
+                 "at least one label mass increment must be positive",
+                 inc_path)
+
+    sup_tol = _coerce_int(raw.get("supplemental_tolerance"),
+                          "/label_audit/supplemental_tolerance", errors,
+                          field="supplemental_tolerance")
+    if sup_tol is not None and sup_tol < 0:
+        _err(errors, "out_of_range",
+             "'supplemental_tolerance' must be non-negative",
+             "/label_audit/supplemental_tolerance")
+
+    return {"increments": increments, "tolerance": sup_tol}
+
+
 def parse_request(body: Any) -> dict[str, Any]:
     """Validate the inversion request body.
 
@@ -52,8 +116,12 @@ def parse_request(body: Any) -> dict[str, Any]:
 
         {
           "target": int, "tolerance": int,
-          "components": [{"id": str, "mass": int, "min": int, "max": int}, ...]
+          "components": [{"id": str, "mass": int, "min": int, "max": int}, ...],
+          "label_audit": None | {"increments": [int, ...], "tolerance": int}
         }
+
+    ``label_audit.increments`` stays aligned with the submitted component
+    order; the service maps it into canonical (id-sorted) coordinates.
 
     Raises :class:`RequestError` with locatable field errors otherwise.
     """
@@ -72,6 +140,9 @@ def parse_request(body: Any) -> dict[str, Any]:
         _err(errors, "out_of_range", "'tolerance' must be non-negative", "/tolerance")
 
     comps_raw = body.get("components")
+    comps_shape_ok = (
+        isinstance(comps_raw, list)
+        and MIN_COMPONENTS <= len(comps_raw) <= MAX_COMPONENTS)
     if not isinstance(comps_raw, list):
         _err(errors, "invalid_type",
              "'components' must be a list of 2..16 component objects",
@@ -128,7 +199,14 @@ def parse_request(body: Any) -> dict[str, Any]:
             "max": hi if hi is not None else 0,
         })
 
+    # The section is validated independently of the main inversion fields;
+    # its item-by-item length check only runs when the components array has a
+    # sound shape (field-level errors inside components do not affect it).
+    label_audit = _parse_label_audit(
+        body, len(components) if comps_shape_ok else None, errors)
+
     if errors:
         raise RequestError(errors)
 
-    return {"target": target, "tolerance": tol, "components": components}
+    return {"target": target, "tolerance": tol, "components": components,
+            "label_audit": label_audit}
