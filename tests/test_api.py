@@ -187,5 +187,178 @@ class ApiTests(unittest.TestCase):
                           [e["path"] for e in body["errors"]])
 
 
+# --------------------------------------------------------------------------- #
+# Isotope-label supplementary-peak audit
+#
+# masses 4 and 6, target 11, tolerance 1: optimal masses 10 (below) and 12
+# (above), minimum particle count 2.  The canonical (lexicographically
+# smallest) winner is (a=0, b=2) at mass 12; the alternative winner is
+# (a=1, b=1) at mass 10.
+# --------------------------------------------------------------------------- #
+
+LABEL_BODY = {
+    "target": 11, "tolerance": 1,
+    "components": [
+        {"id": "a", "mass": 4, "min": 0, "max": 6},
+        {"id": "b", "mass": 6, "min": 0, "max": 6},
+    ],
+}
+
+
+class LabelAuditApiTests(unittest.TestCase):
+    def _counts(self, doc):
+        return {c["id"]: c for c in doc["counts"]}
+
+    def test_distinguishable_returns_nearest_counterexample(self):
+        # Label component 'a' by +1: canonical labeled mass L* = 12, the
+        # alternative (1, 1) lands at 11 -> gap 1; tolerance 0 excludes it.
+        payload = {**LABEL_BODY, "label_audit": {
+            "label_increments": [1, 0], "supplementary_tolerance": 0}}
+        with ServerFixture() as fx:
+            status, body = fx.post(payload)
+        self.assertEqual(status, 200)
+        audit = body["label_audit"]
+        self.assertEqual(audit["conclusion"], "distinguishable")
+        self.assertEqual(audit["reference_labeled_mass"], 12)
+        self.assertIsNone(audit["indistinguishable_witness"])
+        near = audit["nearest_counterexample"]
+        self.assertEqual(near["labeled_total_mass"], 11)
+        self.assertEqual(near["labeled_mass_absolute_error"], 1)
+        self.assertEqual(near["margin_to_tolerance"], 1)
+        counts = self._counts(near)
+        self.assertEqual(counts["a"]["count"], 1)
+        self.assertEqual(counts["b"]["count"], 1)
+        self.assertEqual(counts["a"]["labeled_mass"], 5)
+        # Every figure recomputes exactly from the counts.
+        self.assertEqual(
+            near["labeled_total_mass"],
+            sum(c["count"] * c["labeled_mass"] for c in near["counts"]))
+
+    def test_indistinguishable_returns_tolerance_witness(self):
+        payload = {**LABEL_BODY, "label_audit": {
+            "label_increments": [1, 0], "supplementary_tolerance": 1}}
+        with ServerFixture() as fx:
+            status, body = fx.post(payload)
+        self.assertEqual(status, 200)
+        audit = body["label_audit"]
+        self.assertEqual(audit["conclusion"], "indistinguishable")
+        self.assertIsNone(audit["nearest_counterexample"])
+        witness = audit["indistinguishable_witness"]
+        self.assertTrue(witness["within_supplementary_tolerance"])
+        self.assertLessEqual(witness["labeled_mass_absolute_error"], 1)
+        self.assertEqual(witness["labeled_total_mass"], 11)
+        counts = self._counts(witness)
+        self.assertEqual(counts["a"]["count"], 1)
+        self.assertEqual(counts["b"]["count"], 1)
+        # The witness must be a genuinely different count vector that still
+        # belongs to the two-level optimum (same particle count as canonical).
+        self.assertEqual(witness["particle_count"],
+                         audit["canonical_explanation"]["particle_count"])
+        self.assertNotEqual(
+            [c["count"] for c in witness["counts"]],
+            [c["count"] for c in audit["canonical_explanation"]["counts"]])
+
+    def test_increments_align_with_request_component_order(self):
+        # Submit components in non-canonical order (b before a); increments
+        # still refer to the request array position.
+        payload = {
+            "target": 11, "tolerance": 1,
+            "components": [
+                {"id": "b", "mass": 6, "min": 0, "max": 6},
+                {"id": "a", "mass": 4, "min": 0, "max": 6},
+            ],
+            "label_audit": {"label_increments": [0, 1],
+                            "supplementary_tolerance": 0},
+        }
+        with ServerFixture() as fx:
+            status, body = fx.post(payload)
+        self.assertEqual(status, 200)
+        audit = body["label_audit"]
+        self.assertEqual(audit["conclusion"], "distinguishable")
+        increments = {e["id"]: e["increment"]
+                      for e in audit["label_increments"]}
+        self.assertEqual(increments, {"a": 1, "b": 0})
+        self.assertEqual(audit["reference_labeled_mass"], 12)
+
+    def test_audit_off_keeps_original_response_shape(self):
+        # Without label_audit the responses must be byte-for-byte shaped as
+        # before the feature: no audit block on success, ambiguity or the
+        # unsatisfiable response.
+        with ServerFixture() as fx:
+            status, body = fx.post(LABEL_BODY)
+            self.assertEqual(status, 200)
+            self.assertNotIn("label_audit", body)
+
+            status, body = fx.post(BODY)
+            self.assertEqual(status, 200)
+            self.assertNotIn("label_audit", body)
+
+            unsat = {
+                "target": 50, "tolerance": 1,
+                "components": [
+                    {"id": "a", "mass": 7, "min": 1, "max": 4},
+                    {"id": "b", "mass": 13, "min": 1, "max": 4},
+                ],
+            }
+            status, body = fx.post(unsat)
+            self.assertEqual(status, 200)
+            self.assertEqual(body["status"], "unsatisfiable")
+            self.assertNotIn("label_audit", body)
+
+    def test_unique_optimum_reports_unambiguous(self):
+        payload = {**BODY, "label_audit": {
+            "label_increments": [1, 0, 0], "supplementary_tolerance": 10}}
+        with ServerFixture() as fx:
+            status, body = fx.post(payload)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["unique"])
+        self.assertEqual(body["label_audit"]["conclusion"], "unambiguous")
+        self.assertEqual(body["label_audit"]["reference_labeled_mass"],
+                         body["label_audit"]["canonical_explanation"]
+                         ["labeled_total_mass"])
+
+    def test_audit_on_unsatisfiable_is_rejected(self):
+        payload = {
+            "target": 50, "tolerance": 1,
+            "components": [
+                {"id": "a", "mass": 7, "min": 1, "max": 4},
+                {"id": "b", "mass": 13, "min": 1, "max": 4},
+            ],
+            "label_audit": {"label_increments": [1, 0],
+                            "supplementary_tolerance": 1},
+        }
+        with ServerFixture() as fx:
+            status, body = fx.post(payload)
+        self.assertEqual(status, 422)
+        self.assertEqual(body["error"]["code"], "label_audit_not_applicable")
+
+    def test_label_audit_validation_errors_are_locatable(self):
+        cases = [
+            ({"label_increments": [1], "supplementary_tolerance": 1},
+             "/label_audit/label_increments"),
+            ({"label_increments": [-1, 0], "supplementary_tolerance": 1},
+             "/label_audit/label_increments/0"),
+            ({"label_increments": [0, 0], "supplementary_tolerance": 1},
+             "/label_audit/label_increments"),
+            ({"label_increments": [1, 0], "supplementary_tolerance": -1},
+             "/label_audit/supplementary_tolerance"),
+            ({"supplementary_tolerance": 1},
+             "/label_audit/label_increments"),
+        ]
+        with ServerFixture() as fx:
+            for audit, expected_path in cases:
+                status, body = fx.post({**LABEL_BODY, "label_audit": audit})
+                self.assertEqual(status, 400, audit)
+                paths = [e["path"] for e in body["errors"]]
+                self.assertIn(expected_path, paths)
+
+    def test_label_audit_must_be_object(self):
+        payload = {**LABEL_BODY, "label_audit": [1, 0]}
+        with ServerFixture() as fx:
+            status, body = fx.post(payload)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["errors"][0]["path"], "/label_audit")
+
+
 if __name__ == "__main__":
     unittest.main()

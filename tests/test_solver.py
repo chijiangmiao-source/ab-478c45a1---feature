@@ -181,5 +181,144 @@ class SolverTests(unittest.TestCase):
             self.assertLessEqual(abs(mass - T), 1_000_000)
 
 
+def brute_label_audit(masses, los, his, T, tol, increments, sup_tol):
+    """Independent reference for the label audit over the full counting box."""
+    reachable = {}
+    ranges = [range(lo, hi + 1) for lo, hi in zip(los, his)]
+    for vec in itertools.product(*ranges):
+        mass = sum(c * m for c, m in zip(vec, masses))
+        reachable.setdefault(mass, []).append(vec)
+    best_dist = min(abs(m - T) for m in reachable)
+    if best_dist > tol:
+        return {"status": "unsatisfiable"}
+    opt_masses = [m for m in reachable if abs(m - T) == best_dist]
+    best_particles = min(min(sum(v) for v in reachable[m]) for m in opt_masses)
+    winners = sorted(v for m in opt_masses for v in reachable[m]
+                     if sum(v) == best_particles)
+    if len(winners) == 1:
+        return {"status": "unambiguous", "canonical": winners[0]}
+    canonical = winners[0]
+    labeled = lambda v: sum(c * (m + d)
+                            for c, m, d in zip(v, masses, increments))
+    Lstar = labeled(canonical)
+    others = [v for v in winners if v != canonical]
+    inside = [v for v in others if abs(labeled(v) - Lstar) <= sup_tol]
+    if inside:
+        return {"status": "indistinguishable", "canonical": canonical,
+                "Lstar": Lstar,
+                "winners_inside": sorted(inside)}
+    nearest = min(others, key=lambda v: (abs(labeled(v) - Lstar), v))
+    return {"status": "distinguishable", "canonical": canonical,
+            "Lstar": Lstar, "nearest": nearest,
+            "gap": abs(labeled(nearest) - Lstar)}
+
+
+class LabelAuditSolverTests(unittest.TestCase):
+    def _run_audit(self, masses, los, his, T, tol, increments, sup_tol):
+        comps = [Component(chr(ord("A") + i), masses[i], los[i], his[i])
+                 for i in range(len(masses))]
+        solver = Solver(comps, T, tol, node_budget=10_000_000)
+        result = solver.solve(max_collect=3)
+        expected = brute_label_audit(masses, los, his, T, tol,
+                                     increments, sup_tol)
+        if expected["status"] == "unsatisfiable":
+            self.assertEqual(result["status"], "unsatisfiable")
+            return None
+        self.assertEqual(result["status"], "optimal")
+        if expected["status"] == "unambiguous":
+            self.assertTrue(result["unique"])
+            return None
+        self.assertFalse(result["unique"])
+        audit = solver.label_audit(
+            result["winning_blocks"], result["vectors"],
+            increments, sup_tol, truncated=result["truncated_list"])
+        self.assertEqual(tuple(audit["canonical_vector"]),
+                         expected["canonical"])
+        self.assertEqual(audit["reference_labeled_mass"], expected["Lstar"])
+        if expected["status"] == "indistinguishable":
+            self.assertEqual(audit["conclusion"], "indistinguishable")
+            witness = tuple(audit["witness_vector"])
+            self.assertNotEqual(witness, expected["canonical"])
+            self.assertIn(witness, expected["winners_inside"])
+            self.assertLessEqual(
+                audit["witness_labeled_absolute_error"], sup_tol)
+        else:
+            self.assertEqual(audit["conclusion"], "distinguishable")
+            self.assertEqual(tuple(audit["nearest_vector"]),
+                             expected["nearest"])
+            self.assertEqual(audit["nearest_labeled_absolute_error"],
+                             expected["gap"])
+            self.assertGreater(audit["nearest_labeled_absolute_error"], sup_tol)
+            self.assertEqual(audit["margin_to_tolerance"],
+                             expected["gap"] - sup_tol)
+        return audit
+
+    def test_random_audits(self):
+        rng = random.Random(20260924)
+        exercised = {"indistinguishable": 0, "distinguishable": 0,
+                     "unambiguous": 0, "unsatisfiable": 0}
+        for trial in range(1500):
+            k = rng.randint(2, 5)
+            masses = [rng.randint(1, 30) for _ in range(k)]
+            los = [rng.randint(0, 2) for _ in range(k)]
+            his = [lo + rng.randint(0, 4) for lo in los]
+            T = rng.randint(0, sum(m * h for m, h in zip(masses, his)) + 4)
+            tol = rng.choice([0, 0, 1, 2, 5])
+            increments = [rng.choice([0, 0, 1, 2, 7]) for _ in range(k)]
+            increments[rng.randrange(k)] = rng.choice([1, 2, 7])
+            sup_tol = rng.choice([0, 0, 1, 2, 3, 10])
+            with self.subTest(trial=trial, masses=masses, los=los, his=his,
+                              T=T, tol=tol, increments=increments,
+                              sup_tol=sup_tol):
+                ref = brute_label_audit(masses, los, his, T, tol,
+                                        increments, sup_tol)
+                exercised[ref["status"]] += 1
+                self._run_audit(masses, los, his, T, tol, increments, sup_tol)
+        # Both audit outcomes must actually be covered.
+        self.assertGreater(exercised["indistinguishable"], 0)
+        self.assertGreater(exercised["distinguishable"], 0)
+
+    def test_audit_two_optimal_masses(self):
+        # masses 4/6, T 11, tol 1: winners (0,2) at mass 12 and (1,1) at 10.
+        self._run_audit([4, 6], [0, 0], [6, 6], 11, 1, [1, 0], 0)
+        self._run_audit([4, 6], [0, 0], [6, 6], 11, 1, [1, 0], 1)
+        self._run_audit([4, 6], [0, 0], [6, 6], 11, 1, [0, 3], 2)
+
+    def test_audit_with_lower_bounds(self):
+        self._run_audit([3, 5, 7], [2, 1, 1], [6, 5, 4], 25, 1,
+                        [2, 0, 1], 1)
+        self._run_audit([3, 5, 7], [2, 1, 1], [6, 5, 4], 25, 1,
+                        [2, 0, 1], 10)
+
+    def test_audit_large_bounds_not_expanded(self):
+        # Equal masses at million-scale bounds give 1001 winners; the audit
+        # walks the min-count DAG only and returns instantly.
+        comps = [Component("A", 100_000, 0, 1_000_000),
+                 Component("B", 100_000, 0, 1_000_000)]
+        solver = Solver(comps, 100_000_000, 0, node_budget=10_000_000)
+        result = solver.solve(max_collect=5)
+        self.assertFalse(result["unique"])
+        self.assertTrue(result["truncated_list"])
+        audit = solver.label_audit(
+            result["winning_blocks"], result["vectors"], [1, 0], 0,
+            truncated=True)
+        self.assertEqual(audit["conclusion"], "distinguishable")
+        # Nearest labeled peak: swap one B for one labeled A -> gap 1.
+        self.assertEqual(audit["nearest_labeled_absolute_error"], 1)
+        self.assertEqual(audit["margin_to_tolerance"], 1)
+        self.assertLess(solver.nodes, 10_000)
+
+    def test_audit_large_bounds_inside_window(self):
+        comps = [Component("A", 100_000, 0, 1_000_000),
+                 Component("B", 100_000, 0, 1_000_000)]
+        solver = Solver(comps, 100_000_000, 0, node_budget=10_000_000)
+        result = solver.solve(max_collect=5)
+        audit = solver.label_audit(
+            result["winning_blocks"], result["vectors"], [1, 0], 2,
+            truncated=True)
+        self.assertEqual(audit["conclusion"], "indistinguishable")
+        self.assertEqual(audit["witness_labeled_absolute_error"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

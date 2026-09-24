@@ -128,7 +128,86 @@ def parse_request(body: Any) -> dict[str, Any]:
             "max": hi if hi is not None else 0,
         })
 
+    label_audit = _parse_label_audit(body.get("label_audit"),
+                                     len(comps_raw) if isinstance(comps_raw, list) else 0,
+                                     errors)
+
     if errors:
         raise RequestError(errors)
 
-    return {"target": target, "tolerance": tol, "components": components}
+    return {"target": target, "tolerance": tol, "components": components,
+            "label_audit": label_audit}
+
+
+def _parse_label_audit(raw: Any, n_components: int,
+                       errors: list[ValidationError]) -> dict[str, Any] | None:
+    """Validate the optional isotope-label supplementary-peak audit request.
+
+    Shape::
+
+        "label_audit": {
+          "label_increments": [<non-negative int>, ...],  # one per component
+          "supplementary_tolerance": <non-negative int>
+        }
+
+    The increments array corresponds item-by-item to the ``components`` array
+    and must carry at least one strictly positive increment.  Returns the
+    normalized dict, ``None`` when omitted, or records locatable field errors.
+    """
+    if raw is None:
+        return None
+    base = "/label_audit"
+    if not isinstance(raw, dict):
+        _err(errors, "invalid_type",
+             "'label_audit' must be an object", base)
+        return None
+
+    increments: list[int] = []
+    inc_raw = raw.get("label_increments")
+    inc_path = f"{base}/label_increments"
+    if not isinstance(inc_raw, list):
+        _err(errors, "invalid_type",
+             "'label_increments' must be a list of non-negative integer "
+             "mass increments, one entry per component", inc_path)
+    else:
+        if n_components and len(inc_raw) != n_components:
+            _err(errors, "out_of_range",
+                 f"'label_increments' must contain exactly {n_components} "
+                 f"entries aligned with 'components', got {len(inc_raw)}",
+                 inc_path)
+        any_positive = False
+        entry_errors = 0
+        for i, item in enumerate(inc_raw):
+            before = len(errors)
+            val = _coerce_int(item, f"{inc_path}/{i}", errors,
+                              field="label_increments[]")
+            if len(errors) != before:
+                entry_errors += 1
+                continue
+            if val < 0:
+                _err(errors, "out_of_range",
+                     "label mass increment must be non-negative",
+                     f"{inc_path}/{i}")
+                entry_errors += 1
+                continue
+            if val > 0:
+                any_positive = True
+            increments.append(val)
+        if n_components and len(inc_raw) == n_components:
+            if entry_errors == 0 and not any_positive:
+                _err(errors, "out_of_range",
+                     "'label_increments' must contain at least one strictly "
+                     "positive increment", inc_path)
+
+    sup_tol = _coerce_int(raw.get("supplementary_tolerance"),
+                          f"{base}/supplementary_tolerance", errors,
+                          field="supplementary_tolerance")
+    if sup_tol is not None and sup_tol < 0:
+        _err(errors, "out_of_range",
+             "'supplementary_tolerance' must be non-negative",
+             f"{base}/supplementary_tolerance")
+
+    return {
+        "label_increments": increments,
+        "supplementary_tolerance": sup_tol if sup_tol is not None else 0,
+    }
